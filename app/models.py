@@ -140,6 +140,59 @@ class Segment(Base):
     )
 
 
+class MutexNamespace(Base):
+    """互斥实验命名空间：成员开关按万分槽位瓜分同一用户哈希空间。
+
+    命名空间只持有描述与成员关系（成员见 MutexNamespaceMember）；
+    整体更新（PUT）时在单一事务内删除旧成员、写入新成员。
+    命名空间配置不随开关版本快照保存：仅判定开关当前版本时参与，
+    钉住历史 config_version 的判定完全不读取命名空间。
+    """
+
+    __tablename__ = "mutex_namespaces"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    namespace_key: Mapped[str] = mapped_column(
+        String(128), unique=True, nullable=False, index=True
+    )
+    description: Mapped[str] = mapped_column(String(512), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class MutexNamespaceMember(Base):
+    """命名空间成员开关：``[slot_start, slot_end)`` 万分槽位 + 未入组兜底变体。
+
+    - 同一命名空间内成员区间半开不重叠（保存期校验，422）；
+    - flag_key 全局唯一：一个开关至多加入一个命名空间，判定期按
+      flag_key 唯一定位命名空间，哈希输入为 ``namespace_key:user_id``；
+    - 成员开关存在、兜底变体存在于开关当前配置由写入期校验保证；
+      删除成员开关或通过配置更新移除兜底变体一律 409（解除关系只能
+      经由命名空间整体更新移除成员）。
+    """
+
+    __tablename__ = "mutex_namespace_members"
+    __table_args__ = (
+        UniqueConstraint(
+            "namespace_key", "flag_key", name="uq_mutex_member_namespace_flag"
+        ),
+        UniqueConstraint("flag_key", name="uq_mutex_member_flag"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    namespace_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    flag_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    slot_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    slot_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    fallback_variant_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class Exposure(Base):
     """一次实验曝光：把判定快照的关键字段固化为不可变记录。
 
@@ -201,8 +254,8 @@ class DecisionSnapshot(Base):
     bucket_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
     matched_rule_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     variant_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    # 判定路径：rule / bucket / override。老数据由 ensure_snapshot_decision_path
-    # 按 matched_rule_index 是否为空回填。
+    # 判定路径：rule / bucket / override / inactive / excluded。老数据由
+    # ensure_snapshot_decision_path 按 matched_rule_index 是否为空回填。
     decision_path: Mapped[str | None] = mapped_column(String(16), nullable=True)
     explanation_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

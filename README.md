@@ -12,6 +12,7 @@
 - 每次创建 / 更新在**同一事务**中保存一份**不可变配置版本**，历史版本可查询、可指定用于判定；
 - 支持**版本化生效窗口（activation_window）**：按所选配置版本的 `[active_from, active_until)` 判定，窗口外跳过 override、规则与分桶，直接返回兜底变体（`decision_path="inactive"`）；窗口随当前配置与每个历史版本一同保存；
 - 支持**按用户的临时强制变体（override）**：未指定 `config_version` 时优先于规则与分桶，可带过期时间，到期 / 变体被移除后自动失效；
+- 支持**互斥实验命名空间（mutex namespaces）**：多个成员开关在同一命名空间内按 `[start,end)` 万分槽位瓜分 `namespace_key:user_id` 的稳定哈希空间，区间互不重叠从而保证同一用户同一时刻只入组一个实验；未命中成员区间的用户直接返回该成员配置的兜底变体（`decision_path="excluded"`），钉住历史 `config_version` 的判定不应用命名空间；
 - 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
 - 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**；
 - 支持**实验曝光归因**：把判定快照的 `flag_key` / `user_id` / `config_version` / `variant_key` 与原判定时间固化为不可变曝光记录（`exposure_id` 幂等），并按版本与变体汇总去重用户数与曝光数；删除开关不删除历史曝光；
@@ -78,6 +79,16 @@ curl -sS -X POST http://localhost:8000/api/v1/segments \
          {"type":"condition","attribute":"region","operator":"in","values":["cn","sg"]},
          {"type":"not","child":{"type":"condition","attribute":"banned","operator":"eq","values":[true]}},
          {"type":"segment","key":"vip_users"}]}}'
+
+# 6) 互斥实验命名空间：new_checkout 占槽位 [0,5000)，未入组用户直接得兜底 off
+#    （槽位 = sha256("growth:<user_id>")[:8] % 10000）
+curl -sS -X POST http://localhost:8000/api/v1/namespaces \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace_key":"growth","description":"增长互斥实验","members":[
+        {"flag_key":"new_checkout","slot_start":0,"slot_end":5000,"fallback_variant_key":"off"}]}'
+curl -sS -X POST http://localhost:8000/api/v1/flags/new_checkout/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"user-2002","context":{}}'
 ```
 
 ## API 一览
@@ -87,7 +98,11 @@ curl -sS -X POST http://localhost:8000/api/v1/segments \
 | `POST` | `/api/v1/flags` | 创建 / 更新开关（已存在则 `version + 1`，同事务保存不可变版本） |
 | `GET` | `/api/v1/flags` | 列出全部开关 |
 | `GET` | `/api/v1/flags/{flag_key}` | 查看单个开关 |
-| `DELETE` | `/api/v1/flags/{flag_key}` | 删除开关（版本历史与 override 一并删除） |
+| `DELETE` | `/api/v1/flags/{flag_key}` | 删除开关（版本历史与 override 一并删除；命名空间成员开关需先解除成员关系，否则 `409`） |
+| `POST` | `/api/v1/namespaces` | 创建互斥实验命名空间（万分槽位成员 + 兜底变体；区间重叠 / 成员或兜底变体不存在 `422`，key 重复或成员已属其他命名空间 `409`） |
+| `GET` | `/api/v1/namespaces` | 列出全部命名空间 |
+| `GET` | `/api/v1/namespaces/{namespace_key}` | 查看单个命名空间及其成员 |
+| `PUT` | `/api/v1/namespaces/{namespace_key}` | 整体更新命名空间（全量覆盖描述与成员；不存在 `404`，非法成员 `422`，成员已属其他命名空间 `409`） |
 | `POST` | `/api/v1/segments` | 创建受众分群（嵌套 all/any/not 表达式，可引用其他分群；循环引用 / 引用缺失 / 过深过大返回 `422`，key 重复返回 `409`） |
 | `GET` | `/api/v1/segments` | 列出全部分群 |
 | `GET` | `/api/v1/segments/{segment_key}` | 查看单个分群 |
@@ -307,6 +322,77 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/new_checkout/evaluate \
 # -> {"variant_key":"on","decision_path":"override","matched_rule":null,"bucket_value":null,...}
 ```
 
+### 互斥实验命名空间（mutex namespaces）
+
+多个实验同时放量时，为避免同一用户被重复计入多组实验，可用**互斥命名空间**把成员开关的流量建立在同一条稳定哈希空间上：命名空间持有若干**成员开关**，每个成员配置一个 `[slot_start, slot_end)` 的**万分槽位区间**与一个**未入组兜底变体**。判定成员开关时，服务对 `namespace_key:user_id` 做与分桶同构的稳定哈希（映射到 `0-9999`）：
+
+- 槽位**落在**该成员区间 `[start,end)` 内（起点含、终点不含）→ **入组**，继续原有的 override → 规则 → 分桶判定；
+- 槽位**不在**区间内 → **未入组**，跳过 override、规则与分桶，直接返回成员配置的 `fallback_variant_key`，响应 `decision_path="excluded"`、`matched_rule=null`、`bucket_value=null`。
+
+因为同一用户在同一命名空间内对所有成员算出的是**同一个槽位**，且保存时强制成员区间**互不重叠**，所以任一用户在同一命名空间内**至多入组一个成员实验**，从机制上保证互斥。成员区间不必铺满 `0-9999`，也可以只占其中一段（其余用户对所有成员都未入组）。
+
+```bash
+# 1) 准备两个开关（各自至少含兜底变体 off）
+curl -sS -X POST http://localhost:8000/api/v1/flags \
+  -H 'Content-Type: application/json' \
+  -d '{"flag_key":"checkout_exp","variants":[{"key":"on","weight":50},{"key":"off","weight":50}],"rules":[]}'
+curl -sS -X POST http://localhost:8000/api/v1/flags \
+  -H 'Content-Type: application/json' \
+  -d '{"flag_key":"billing_exp","variants":[{"key":"on","weight":50},{"key":"off","weight":50}],"rules":[]}'
+
+# 2) 创建命名空间：两个成员各占一半槽位，合起来铺满 [0,10000)，未入组兜底 off
+curl -sS -X POST http://localhost:8000/api/v1/namespaces \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace_key":"growth","description":"增长互斥实验","members":[
+        {"flag_key":"checkout_exp","slot_start":0,"slot_end":5000,"fallback_variant_key":"off"},
+        {"flag_key":"billing_exp","slot_start":5000,"slot_end":10000,"fallback_variant_key":"off"}]}'
+
+# 3) 查询 / 列表
+curl -sS http://localhost:8000/api/v1/namespaces/growth
+curl -sS http://localhost:8000/api/v1/namespaces
+
+# 4) 整体更新（PUT 为全量覆盖：未出现在 members 中的旧成员被移除）
+curl -sS -X PUT http://localhost:8000/api/v1/namespaces/growth \
+  -H 'Content-Type: application/json' \
+  -d '{"description":"调到 30% 放量","members":[
+        {"flag_key":"checkout_exp","slot_start":0,"slot_end":3000,"fallback_variant_key":"off"},
+        {"flag_key":"billing_exp","slot_start":3000,"slot_end":6000,"fallback_variant_key":"off"}]}'
+```
+
+成员字段与校验：
+
+| 字段 | 说明 |
+| --- | --- |
+| `flag_key` | 成员开关 key，必须**已存在**；一个开关**至多属于一个命名空间**（`flag_key` 全局唯一） |
+| `slot_start` / `slot_end` | 万分槽位半开区间，要求 `0 <= slot_start < slot_end <= 10000` |
+| `fallback_variant_key` | 未入组时直接返回的兜底变体，必须存在于该开关**当前配置**的 `variants` 中 |
+
+- 同一命名空间内成员 `flag_key` 不可重复、槽位区间**不得重叠**（相邻允许：前一个 `end` 等于后一个 `start`）；区间重叠 / key 重复 / 边界非法返回 `422`；成员开关不存在或兜底变体不存在同样返回 `422`；成员列表允许为空（先建命名空间后挂成员）；
+- 创建时 `namespace_key` 已存在、或某成员开关已属于**其他命名空间**返回 `409`；整体更新想把其他命名空间的成员纳入也返回 `409`（需先在原命名空间更新中移除该成员）；命名空间不存在（查询 / 更新）返回 `404`。
+
+判定行为与边界：
+
+- 命名空间闸门位于**生效窗口之后、override 之前**：窗口未生效时直接 `inactive`，不进入命名空间判定；入组后才可能被 override 命中；未入组时即使存在 override 也直接返回兜底；
+- **钉住历史 `config_version` 的判定不应用命名空间**：指定 `config_version` 时完全按该历史版本的规则与权重判定，解释链中也不含命名空间步骤——命名空间是当前放量编排，不进入开关的不可变版本快照；
+- 入组用户的解释链以 `namespace_loaded` → `namespace_slot_computed` 两步开头（记录哈希输入 `namespace_key:user_id`、槽位值与成员区间），随后是原有的 override / 规则 / 分桶步骤；未入组用户再追加一步 `namespace_excluded`（注明槽位、区间与兜底原因）；
+- 命名空间配置**不随开关配置版本保存**，更新命名空间（区间 / 兜底 / 成员）不产生开关新版本，只影响之后的新判定；**已有判定快照不可变**，同一 `request_id` 重试依旧重放首次结果（即使首次 `excluded`、之后区间已调整为入组）。
+
+**引用保护（`409`）**：为保证未入组用户的兜底永远可解析、命名空间不悬挂指向已删除的开关——
+
+- **直接删除成员开关返回 `409`**：请先 `PUT` 命名空间把该成员移出，再删除开关（`DELETE /flags/{flag_key}`）；
+- **通过配置更新 / 回滚 / 发布批次移除成员的兜底变体返回 `409`**：请先 `PUT` 命名空间把兜底改到仍保留的变体，再发布移除该变体的配置；发布批次在**创建时预检**、**提交事务内再核对**，冲突整批 `409`、绝不部分写入；
+- 在命名空间整体更新中**移除某成员**或**更换其兜底变体**本身是允许的（这是调整放量编排的正常操作），不受上述 `409` 限制。
+
+```bash
+# 未入组示例（槽位不在 [0,5000)）
+curl -sS -X POST http://localhost:8000/api/v1/flags/checkout_exp/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"user-2002","context":{}}'
+# -> {"variant_key":"off","decision_path":"excluded","matched_rule":null,"bucket_value":null,...}
+```
+
+命名空间两张表（`mutex_namespaces` / `mutex_namespace_members`）随服务启动自动创建（新库由建表流程创建，老库启动时幂等补齐），无需手工迁移；Docker Compose 一键启动方式不变。
+
 ### 规则操作符
 
 | operator | 语义 | values 用法 |
@@ -426,11 +512,12 @@ curl -sS -X DELETE http://localhost:8000/api/v1/segments/vip_users
 - `decision_path = "bucket"` 时 `matched_rule` 为 `null`，`bucket_value` 为 `0-99`；
 - `decision_path = "override"` 时（按用户临时强制变体命中）`matched_rule` 与 `bucket_value` 均为 `null`，解释链只含 `override_loaded` 与 `override_selected` 两步；
 - `decision_path = "inactive"` 时（配置在生效窗口之外）`matched_rule` 与 `bucket_value` 均为 `null`，`variant_key` 为窗口的兜底变体，解释链只含 `activation_window_loaded` 与 `activation_window_inactive` 两步（含边界说明）；
+- `decision_path = "excluded"` 时（互斥命名空间槽位未命中成员区间）`matched_rule` 与 `bucket_value` 均为 `null`，`variant_key` 为成员配置的未入组兜底变体，解释链为 `namespace_loaded` → `namespace_slot_computed` → `namespace_excluded`；入组但最终走规则 / 分桶 / override 时，解释链以 `namespace_loaded` → `namespace_slot_computed` 两步开头再衔接原链路；
 - 配置更新会使 `config_version` 自增；**同一版本配置下，同一 `flag_key + user_id` 永远落入同一桶**。
 
 ### 幂等
 
-判定请求可携带自定义 `request_id`。同一 `request_id` 的重复请求直接返回**首次判定快照**（即使第二次 context、`config_version` 不同，首次生效的 override 事后被修改、到期、删除，或生效窗口状态已随时间变化），适合客户端超时重试。若同一 `request_id` 搭配了不同的 `flag_key/user_id`，返回 `409`。不携带时服务自动生成 UUID。
+判定请求可携带自定义 `request_id`。同一 `request_id` 的重复请求直接返回**首次判定快照**（即使第二次 context、`config_version` 不同，首次生效的 override 事后被修改、到期、删除，生效窗口状态已随时间变化，或互斥命名空间的成员区间 / 兜底变体事后被调整），适合客户端超时重试。若同一 `request_id` 搭配了不同的 `flag_key/user_id`，返回 `409`。不携带时服务自动生成 UUID。
 
 ### 发布前影响预览（只读）
 
@@ -708,6 +795,14 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 
 随后按变体配置顺序累加权重切分 `[0, 100)`：上例中桶 `0-19` → `red`（20%），`20-99` → `blue`（80%）。变体顺序或权重变化即视为配置发布（`version` 自增），此前的稳定性不再保证——这是刻意的设计：发布即重新分桶。
 
+互斥命名空间的槽位算法同构，但空间为 10000、哈希输入用 `namespace_key`：
+
+```
+slot = int.from_bytes(sha256(f"{namespace_key}:{user_id}")[:8], "big") % 10000
+```
+
+成员区间在 `[0, 10000)` 内切分；同一用户在同一命名空间的所有成员上得到同一槽位，区间不重叠即互斥。槽位哈希与开关自身的分桶哈希相互独立，调整某开关的变体权重不影响其命名空间槽位。
+
 ## 项目结构
 
 ```
@@ -718,10 +813,10 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── segments.py    # 受众分群表达式引擎：all/any/not/condition/segment 递归解析、短路 trace、循环引用与深度校验
 │   ├── schemas.py     # Pydantic 请求/响应模型与配置校验（含分群递归表达式模型）
 │   ├── cursor.py      # 审计列表的不透明签名游标（边界 + 过滤绑定 + 高水位）
-│   ├── crud.py        # 配置、版本、override、分群、发布批次、曝光与快照持久化（含原子提交、引用保护、分页查询与索引补齐）
-│   ├── models.py      # SQLAlchemy ORM（segments / flag_configs / flag_config_versions / flag_overrides / release_batches / exposures / decision_snapshots）
+│   ├── crud.py        # 配置、版本、override、分群、互斥命名空间、发布批次、曝光与快照持久化（含原子提交、引用保护、分页查询与索引补齐）
+│   ├── models.py      # SQLAlchemy ORM（segments / mutex_namespaces / mutex_namespace_members / flag_configs / flag_config_versions / flag_overrides / release_batches / exposures / decision_snapshots）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（196 项，含分群、override、生效窗口、发布批次与曝光归因用例）
+├── tests/             # pytest：引擎单测 + API 集成测试（234 项，含分群、override、生效窗口、互斥命名空间、发布批次与曝光归因用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -737,8 +832,9 @@ python -m pytest -q
 ## 说明与边界
 
 - 服务定位为**本地 / 单机**使用：SQLite + 单实例，未做多副本一致性；
-- 判定快照只增不删（删除开关不影响历史快照回查）；配置版本与按用户 override 随开关一并删除；
+- 判定快照只增不删（删除开关不影响历史快照回查）；配置版本与按用户 override 随开关一并删除（成员开关需先解除命名空间成员关系，否则删除返回 `409`）；
+- 互斥命名空间的成员区间与兜底变体是**当前态**配置，不进入开关版本快照、不随开关删除：仅判定开关当前版本时读取，钉住历史 `config_version` 一律不应用；直接删除成员开关或移除其兜底变体会破坏未入组兜底的可解析性，因此一律 `409`，解除关系 / 更换兜底请走命名空间整体更新；
 - 曝光记录（`exposures`）只增不删：删除开关不会删除历史曝光，曝光汇总对已删除开关仍可查询；曝光固化了判定时的 `config_version` 与 `variant_key`，后续配置更新、回滚不影响已固化的归因；
 - 发布批次（`release_batches`）只增不删：`pending` 批次保留创建时的候选与预览摘要，`committed` 批次额外固化各开关提交后的新版本号；删除开关不会删除历史批次记录（其中仅存创建时的配置快照与预览，不影响线上判定）；
 - 快照保存判定时的 `config_version` 与 `decision_path`（含 override 的变体与原因）；幂等重放重建 `matched_rule` 详情时优先取该版本的历史配置，版本记录缺失（如开关被删除重建）时回退到当前版本配置；
-- 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录；升级到含 override 的版本时，老库会自动给快照表补 `decision_path` 列并回填 `rule` / `bucket`；升级到含生效窗口的版本时，老库会自动给 `flag_configs` / `flag_config_versions` 补 `activation_window_json` 列（老数据为 `NULL`，视为无窗口）；升级到含受众分群的版本时，老库会自动创建 `segments` 表；升级到含曝光归因的版本时，启动建表流程会自动创建 `exposures` 表（含索引）。以上迁移均为幂等，重复启动无副作用。
+- 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录；升级到含 override 的版本时，老库会自动给快照表补 `decision_path` 列并回填 `rule` / `bucket`；升级到含生效窗口的版本时，老库会自动给 `flag_configs` / `flag_config_versions` 补 `activation_window_json` 列（老数据为 `NULL`，视为无窗口）；升级到含受众分群的版本时，老库会自动创建 `segments` 表；升级到含曝光归因的版本时，启动建表流程会自动创建 `exposures` 表（含索引）；升级到含互斥命名空间的版本时，老库会自动幂等创建 `mutex_namespaces` / `mutex_namespace_members` 两张表（含唯一约束与索引）。以上迁移均为幂等，重复启动无副作用。

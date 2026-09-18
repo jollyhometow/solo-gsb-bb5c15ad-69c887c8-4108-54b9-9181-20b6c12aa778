@@ -2,8 +2,13 @@
 
 判定顺序：
 0. 配置带生效窗口（activation_window）且当前时刻落在窗口
-   ``[active_from, active_until)`` 之外时，跳过 override、规则与分桶，
-   直接返回兜底变体 inactive_variant_key，decision_path="inactive"。
+   ``[active_from, active_until)`` 之外时，跳过命名空间、override、规则与
+   分桶，直接返回兜底变体 inactive_variant_key，decision_path="inactive"。
+0.5 开关为某互斥实验命名空间成员（仅判定当前版本时参与，钉住历史
+   config_version 不应用命名空间）时，对 ``namespace_key:user_id`` 稳定
+   哈希到 0-9999 的万分槽位：仅当槽位落在成员区间 ``[start,end)`` 才继续
+   override → 规则 → 分桶；否则直接返回成员的兜底变体，
+   decision_path="excluded"。
 1. 未指定 config_version 时，先查该 flag+user 是否存在“未过期且变体仍存在于
    当前配置”的临时强制变体（override）：命中则跳过规则与分桶，直接返回该变体，
    decision_path="override"。到期或变体已移除的记录不生效，继续正常判定。
@@ -12,12 +17,16 @@
 3. 没有规则命中时，对 ``flag_key + ":" + user_id`` 做 SHA-256 稳定哈希，
    映射到 0-99 的桶，再按变体权重顺序切桶选变体。
 
-同一用户在配置不变时结果稳定：哈希输入只含 flag_key 与 user_id。
+同一用户在配置不变时结果稳定：哈希输入只含 flag_key 与 user_id；
+命名空间槽位哈希只含 namespace_key 与 user_id，同一用户在同一命名空间
+的所有成员开关上落入同一槽位，因此区间不重叠的成员互斥。
 """
+
+from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -25,6 +34,9 @@ from app import segments as seg
 
 # 桶空间固定为 100，与“权重总和必须为 100”对应
 BUCKET_SPACE = 100
+
+# 互斥命名空间槽位空间固定为 10000：SHA-256[:8] % 10000
+SLOT_SPACE = 10000
 
 
 @dataclass(frozen=True)
@@ -80,6 +92,115 @@ def stable_bucket(flag_key: str, user_id: str) -> int:
     raw = f"{flag_key}:{user_id}".encode("utf-8")
     digest = hashlib.sha256(raw).digest()
     return int.from_bytes(digest[:8], "big") % BUCKET_SPACE
+
+
+@dataclass(frozen=True)
+class NamespaceMembership:
+    """开关在互斥命名空间中的成员关系（判定前由持久层读取）。"""
+
+    namespace_key: str
+    flag_key: str
+    slot_start: int
+    slot_end: int
+    fallback_variant_key: str
+
+
+def stable_slot(namespace_key: str, user_id: str) -> int:
+    """返回 0..9999 的稳定命名空间槽位。
+
+    SHA-256("namespace_key:user_id") 大端取前 8 字节对 10000 取模；
+    只依赖 namespace_key 与 user_id：同一用户在同一命名空间的全部成员
+    开关上落入同一槽位，区间不重叠的成员因此天然互斥。
+    """
+    raw = f"{namespace_key}:{user_id}".encode("utf-8")
+    digest = hashlib.sha256(raw).digest()
+    return int.from_bytes(digest[:8], "big") % SLOT_SPACE
+
+
+def slot_in_member_range(slot: int, member: NamespaceMembership) -> bool:
+    """槽位是否落在成员区间 ``[slot_start, slot_end)``（起点含、终点不含）。"""
+    return member.slot_start <= slot < member.slot_end
+
+
+def excluded_decision(member: NamespaceMembership, user_id: str) -> Decision:
+    """未命中命名空间成员区间：跳过 override、规则与分桶，返回兜底变体。
+
+    进入本函数时槽位一定不在成员区间内（由 slot_in_member_range 判定）。
+    """
+    slot = stable_slot(member.namespace_key, user_id)
+    explanation = [
+        {
+            "step": "namespace_loaded",
+            "detail": {
+                "namespace_key": member.namespace_key,
+                "flag_key": member.flag_key,
+                "slot_range": [member.slot_start, member.slot_end],
+                "fallback_variant_key": member.fallback_variant_key,
+            },
+        },
+        {
+            "step": "namespace_slot_computed",
+            "detail": {
+                "hash_input": f"{member.namespace_key}:{user_id}",
+                "algorithm": "sha256[:8] % 10000",
+                "slot_value": slot,
+                "slot_space": SLOT_SPACE,
+            },
+        },
+        {
+            "step": "namespace_excluded",
+            "detail": {
+                "namespace_key": member.namespace_key,
+                "slot_value": slot,
+                "slot_range": [member.slot_start, member.slot_end],
+                "fallback_variant_key": member.fallback_variant_key,
+                "reason": (
+                    f"槽位 {slot} 不在成员区间 [{member.slot_start}, {member.slot_end}) 内，"
+                    "未入组，跳过 override、规则判定与哈希分桶"
+                ),
+            },
+        },
+    ]
+    return Decision(
+        variant_key=member.fallback_variant_key,
+        decision_path="excluded",
+        bucket_value=None,
+        matched_rule=None,
+        matched_rule_index=None,
+        explanation=explanation,
+    )
+
+
+def prepend_namespace_included(
+    decision: Decision, member: NamespaceMembership, user_id: str
+) -> Decision:
+    """入组时把命名空间闸门的两步解释前置到原有判定链之前。
+
+    判定结果本身（override / rule / bucket）保持不变，仅补充解释链，
+    说明本次判定通过了命名空间互斥闸门。
+    """
+    slot = stable_slot(member.namespace_key, user_id)
+    prefix = [
+        {
+            "step": "namespace_loaded",
+            "detail": {
+                "namespace_key": member.namespace_key,
+                "flag_key": member.flag_key,
+                "slot_range": [member.slot_start, member.slot_end],
+                "fallback_variant_key": member.fallback_variant_key,
+            },
+        },
+        {
+            "step": "namespace_slot_computed",
+            "detail": {
+                "hash_input": f"{member.namespace_key}:{user_id}",
+                "algorithm": "sha256[:8] % 10000",
+                "slot_value": slot,
+                "slot_space": SLOT_SPACE,
+            },
+        },
+    ]
+    return replace(decision, explanation=prefix + decision.explanation)
 
 
 def _compare(actual: Any, operator: str, expected: list[Any]) -> tuple[bool, str]:
@@ -147,7 +268,7 @@ def pick_variant_by_weight(variants: list[Variant], bucket: int) -> tuple[str, t
 @dataclass
 class Decision:
     variant_key: str
-    decision_path: str  # "rule" | "bucket" | "override" | "inactive"
+    decision_path: str  # "rule" | "bucket" | "override" | "inactive" | "excluded"
     bucket_value: int | None
     matched_rule: Rule | None
     matched_rule_index: int | None  # 排序后从 0 开始

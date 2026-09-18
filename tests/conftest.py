@@ -13,7 +13,15 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.database import Base, engine, SessionLocal  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Exposure, FlagConfig, FlagConfigVersion, FlagOverride, Segment  # noqa: E402
+from app.models import (  # noqa: E402
+    Exposure,
+    FlagConfig,
+    FlagConfigVersion,
+    FlagOverride,
+    MutexNamespace,
+    MutexNamespaceMember,
+    Segment,
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -42,6 +50,9 @@ def _clean_flags():
     try:
         db.query(Exposure).delete()
         db.query(FlagOverride).delete()
+        # 命名空间成员先于命名空间与开关删除（成员引用二者 key）
+        db.query(MutexNamespaceMember).delete()
+        db.query(MutexNamespace).delete()
         db.query(FlagConfigVersion).delete()
         db.query(FlagConfig).delete()
         db.query(Segment).delete()

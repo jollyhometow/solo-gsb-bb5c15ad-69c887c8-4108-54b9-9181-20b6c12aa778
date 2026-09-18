@@ -352,7 +352,7 @@ class EvaluateResponse(BaseModel):
     )
     bucket_value: int | None = Field(description="0-99 的稳定哈希分桶值；规则命中时为 null")
     variant_key: str
-    decision_path: Literal["rule", "bucket", "override", "inactive"]
+    decision_path: Literal["rule", "bucket", "override", "inactive", "excluded"]
     explanation: list[ExplanationStep]
 
 
@@ -365,7 +365,7 @@ class SnapshotResponse(BaseModel):
     bucket_value: int | None
     matched_rule_index: int | None
     variant_key: str
-    decision_path: Literal["rule", "bucket", "override", "inactive"]
+    decision_path: Literal["rule", "bucket", "override", "inactive", "excluded"]
     explanation: list[ExplanationStep]
     decided_at: Any
 
@@ -604,5 +604,98 @@ class SegmentResponse(BaseModel):
     segment_key: str
     description: str
     expression: SegmentExpr
+    created_at: Any
+    updated_at: Any
+
+
+# ---------------------------------------------------------------------------
+# 互斥实验命名空间
+# ---------------------------------------------------------------------------
+
+
+class NamespaceMemberIn(BaseModel):
+    """命名空间成员开关：万分槽位区间 ``[slot_start, slot_end)`` + 未入组兜底变体。
+
+    槽位空间为 0-9999，区间半开（起点含、终点不含）：``0 <= start < end <= 10000``。
+    成员开关必须存在、``fallback_variant_key`` 必须存在于该开关当前配置
+    （保存时查库校验，返回 ``422``）；同一命名空间内成员 key 不可重复、
+    槽位区间不得重叠（Pydantic 层在命名空间整体校验）。
+    """
+
+    flag_key: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+    )
+    slot_start: int = Field(ge=0, le=10000, description="槽位区间起点（含），0-10000")
+    slot_end: int = Field(ge=0, le=10000, description="槽位区间终点（不含），0-10000")
+    fallback_variant_key: str = Field(
+        min_length=1, max_length=128, description="未命中槽位区间时直接返回的兜底变体 key"
+    )
+
+    @model_validator(mode="after")
+    def _range_half_open(self) -> "NamespaceMemberIn":
+        if self.slot_start >= self.slot_end:
+            raise ValueError(
+                f"成员 {self.flag_key!r} 的槽位区间非法：要求 0 <= slot_start < slot_end <= 10000，"
+                f"当前为 [{self.slot_start}, {self.slot_end})"
+            )
+        return self
+
+
+class NamespaceBody(BaseModel):
+    """命名空间配置体（成员列表及成员 / 区间校验），创建与整体更新共用。"""
+
+    members: list[NamespaceMemberIn] = Field(
+        default_factory=list, description="成员开关列表；同一命名空间内 flag_key 唯一、槽位区间不重叠"
+    )
+
+    @field_validator("members")
+    @classmethod
+    def _members_non_overlapping(cls, v: list[NamespaceMemberIn]) -> list[NamespaceMemberIn]:
+        keys = [m.flag_key for m in v]
+        if len(set(keys)) != len(keys):
+            raise ValueError("同一命名空间内成员 flag_key 不允许重复")
+        # 半开区间 [start,end) 不重叠：按起点排序后，后一个起点必须 >= 前一个终点；
+        # 相邻（前.end == 后.start）允许。
+        ordered = sorted(v, key=lambda m: m.slot_start)
+        for prev, cur in zip(ordered, ordered[1:]):
+            if cur.slot_start < prev.slot_end:
+                raise ValueError(
+                    "成员槽位区间不允许重叠："
+                    f"{prev.flag_key!r} 的 [{prev.slot_start}, {prev.slot_end}) 与 "
+                    f"{cur.flag_key!r} 的 [{cur.slot_start}, {cur.slot_end}) 相交"
+                )
+        return v
+
+
+class NamespaceCreateRequest(NamespaceBody):
+    """创建互斥实验命名空间（key 随 body 提供，与创建开关 / 分群风格一致）。"""
+
+    namespace_key: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+    )
+    description: str = ""
+
+
+class NamespaceUpsertRequest(NamespaceBody):
+    """整体更新命名空间（key 取自路径，PUT 为全量覆盖语义）。"""
+
+    description: str = ""
+
+
+class NamespaceMemberResponse(BaseModel):
+    """命名空间中单个成员开关的当前关系。"""
+
+    flag_key: str
+    slot_start: int
+    slot_end: int
+    fallback_variant_key: str
+
+
+class NamespaceResponse(BaseModel):
+    """一个互斥实验命名空间的当前状态（成员按 flag_key 升序返回）。"""
+
+    namespace_key: str
+    description: str
+    members: list[NamespaceMemberResponse]
     created_at: Any
     updated_at: Any

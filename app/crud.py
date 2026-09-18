@@ -16,6 +16,8 @@ from app.models import (
     FlagConfig,
     FlagConfigVersion,
     FlagOverride,
+    MutexNamespace,
+    MutexNamespaceMember,
     ReleaseBatch,
     Segment,
     _utcnow,
@@ -24,6 +26,9 @@ from app.schemas import (
     ActivationWindowIn,
     FlagConfigBody,
     FlagUpsertRequest,
+    NamespaceBody,
+    NamespaceCreateRequest,
+    NamespaceUpsertRequest,
     OverrideUpsertRequest,
     RuleIn,
     SegmentCreateRequest,
@@ -58,6 +63,22 @@ class VersionConflict(Exception):
 
 class ExposureConflict(Exception):
     """exposure_id 已被用于指向另一判定快照（request_id 不一致）。"""
+
+
+class NamespaceNotFound(Exception):
+    """命名空间不存在。"""
+
+
+class NamespaceKeyConflict(Exception):
+    """创建命名空间时 key 已存在。"""
+
+
+class NamespaceMemberConflict(Exception):
+    """成员冲突：开关已是其他命名空间成员（一个开关只能属于一个命名空间）。"""
+
+
+class FlagInNamespace(Exception):
+    """开关仍是命名空间成员（或兜底变体将被移除），禁止删除 / 改写配置。"""
 
 
 def serialize_config_body(payload: FlagConfigBody) -> tuple[str, str, str | None]:
@@ -129,10 +150,17 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
     """创建开关；已存在时版本号 +1 并整体覆盖规则/变体。
 
     同一事务中向 flag_config_versions 追加一份完整不可变快照。
+    开关为命名空间成员时，新配置必须保留其未入组兜底变体，否则
+    FlagInNamespace（-> 409），在任何写入前抛出。
     """
+    existing_flag = db.scalar(select(FlagConfig).where(FlagConfig.flag_key == payload.flag_key))
+    if existing_flag is not None:
+        ensure_membership_fallback_variant(
+            db, payload.flag_key, {v.key for v in payload.variants}
+        )
     rules_json, variants_json, window_json = serialize_config_body(payload)
 
-    flag = db.scalar(select(FlagConfig).where(FlagConfig.flag_key == payload.flag_key))
+    flag = existing_flag
     if flag is None:
         flag = FlagConfig(
             flag_key=payload.flag_key,
@@ -191,6 +219,12 @@ def rollback_flag(
             f"开关 {flag_key!r} 没有版本 {target_version}"
         )
 
+    # 命名空间成员的兜底变体在回滚后的配置中也必须存在（409），
+    # 否则未入组用户会失去可解析的兜底变体。
+    ensure_membership_fallback_variant(
+        db, flag_key, {v.key for v in parse_variants(target.variants_json)}
+    )
+
     flag.description = target.description
     flag.rules_json = target.rules_json
     flag.variants_json = target.variants_json
@@ -223,6 +257,14 @@ def delete_flag(db: Session, flag_key: str) -> bool:
     flag = get_flag_or_none(db, flag_key)
     if flag is None:
         return False
+    # 命名空间成员开关禁止直接删除（409）：先经命名空间整体更新移除成员，
+    # 避免命名空间指向已删除开关、互斥闸门静默失效。
+    membership = get_namespace_membership(db, flag_key)
+    if membership is not None:
+        raise FlagInNamespace(
+            f"开关 {flag_key!r} 仍是互斥命名空间 {membership.namespace_key!r} 的成员，"
+            "请先更新该命名空间移除成员后再删除开关"
+        )
     # 版本历史随开关一起删除，避免删除后重建同 key 开关时版本号冲突
     db.execute(delete(FlagConfigVersion).where(FlagConfigVersion.flag_key == flag_key))
     # 按用户强制变体一并删除；重建后的同名开关不带任何 override
@@ -732,6 +774,16 @@ def commit_release(db: Session, batch: ReleaseBatch) -> ReleaseBatch:
                 validate_flag_rule_segments(db, candidate_rules)
             except ValueError as exc:
                 raise VersionConflict(str(exc)) from exc
+            # 命名空间成员的未入组兜底变体必须保留在候选配置中（整批 409）
+            candidate_variant_keys = {
+                v["key"] for v in json.loads(item["variants_json"])
+            }
+            try:
+                ensure_membership_fallback_variant(
+                    db, item["flag_key"], candidate_variant_keys
+                )
+            except FlagInNamespace as exc:
+                raise VersionConflict(str(exc)) from exc
             new_versions[item["flag_key"]] = expected + 1
 
         # 全部条件更新命中后，在同一事务追加不可变版本（只增不改）
@@ -958,6 +1010,274 @@ def ensure_segments_table(db: Session) -> None:
         text(
             "CREATE INDEX IF NOT EXISTS ix_segments_segment_key "
             "ON segments (segment_key)"
+        )
+    )
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 互斥实验命名空间
+# ---------------------------------------------------------------------------
+
+
+def get_namespace(db: Session, namespace_key: str) -> MutexNamespace | None:
+    return db.scalar(
+        select(MutexNamespace).where(MutexNamespace.namespace_key == namespace_key)
+    )
+
+
+def list_namespaces(db: Session) -> Sequence[MutexNamespace]:
+    return db.scalars(
+        select(MutexNamespace).order_by(MutexNamespace.namespace_key)
+    ).all()
+
+
+def list_namespace_members(
+    db: Session, namespace_key: str
+) -> Sequence[MutexNamespaceMember]:
+    """返回命名空间的全部成员，按 flag_key 升序。"""
+    return _get_namespace_members(db, namespace_key)
+
+
+def _get_namespace_members(
+    db: Session, namespace_key: str
+) -> Sequence[MutexNamespaceMember]:
+    return db.scalars(
+        select(MutexNamespaceMember)
+        .where(MutexNamespaceMember.namespace_key == namespace_key)
+        .order_by(MutexNamespaceMember.flag_key)
+    ).all()
+
+
+def get_namespace_membership(
+    db: Session, flag_key: str
+) -> MutexNamespaceMember | None:
+    """返回开关当前所属命名空间的成员关系；不是任何命名空间成员时返回 None。
+
+    flag_key 在成员表全局唯一：一个开关至多属于一个命名空间，判定期据此
+    用 ``namespace_key:user_id`` 计算槽位。
+    """
+    return db.scalar(
+        select(MutexNamespaceMember).where(MutexNamespaceMember.flag_key == flag_key)
+    )
+
+
+def get_active_namespace_membership(
+    db: Session, flag_key: str
+) -> eng.NamespaceMembership | None:
+    """判定期读取：返回引擎使用的不可变成员关系对象，非成员返回 None。"""
+    row = get_namespace_membership(db, flag_key)
+    if row is None:
+        return None
+    return eng.NamespaceMembership(
+        namespace_key=row.namespace_key,
+        flag_key=row.flag_key,
+        slot_start=row.slot_start,
+        slot_end=row.slot_end,
+        fallback_variant_key=row.fallback_variant_key,
+    )
+
+
+def _validate_namespace_members(
+    db: Session, payload: NamespaceBody, *, replace_namespace_key: str | None
+) -> None:
+    """保存期跨表校验成员配置（结构 / 区间不重叠已由 Pydantic 保证）。
+
+    - 每个成员开关必须存在，否则 ValueError（-> 422）；
+    - 兜底变体必须存在于开关当前配置，否则 ValueError（-> 422）；
+    - 成员开关不得已是**其他**命名空间的成员（整体更新自身命名空间时
+      允许同 key 重写），否则 NamespaceMemberConflict（-> 409）。
+    """
+    missing_flags: list[str] = []
+    bad_fallbacks: list[str] = []
+    for member in payload.members:
+        flag = get_flag_or_none(db, member.flag_key)
+        if flag is None:
+            missing_flags.append(member.flag_key)
+            continue
+        variant_keys = {v.key for v in parse_variants(flag.variants_json)}
+        if member.fallback_variant_key not in variant_keys:
+            bad_fallbacks.append(
+                f"成员 {member.flag_key!r} 的兜底变体 {member.fallback_variant_key!r} "
+                "不存在于该开关当前配置"
+            )
+        existing = get_namespace_membership(db, member.flag_key)
+        if existing is not None and existing.namespace_key != replace_namespace_key:
+            raise NamespaceMemberConflict(
+                f"开关 {member.flag_key!r} 已是其他命名空间 "
+                f"{existing.namespace_key!r} 的成员；一个开关只能属于一个命名空间，"
+                "请先在原命名空间的整体更新中移除该成员"
+            )
+    errors = []
+    if missing_flags:
+        errors.append("成员开关不存在：" + ", ".join(missing_flags))
+    errors.extend(bad_fallbacks)
+    if errors:
+        raise ValueError("；".join(errors))
+
+
+def create_namespace(
+    db: Session, payload: NamespaceCreateRequest
+) -> MutexNamespace:
+    """创建命名空间及其成员（单事务）；key 已存在抛 NamespaceKeyConflict。"""
+    if get_namespace(db, payload.namespace_key) is not None:
+        raise NamespaceKeyConflict(f"命名空间 {payload.namespace_key!r} 已存在")
+    _validate_namespace_members(db, payload, replace_namespace_key=None)
+    namespace = MutexNamespace(
+        namespace_key=payload.namespace_key,
+        description=payload.description,
+    )
+    db.add(namespace)
+    db.add_all(
+        [
+            MutexNamespaceMember(
+                namespace_key=payload.namespace_key,
+                flag_key=m.flag_key,
+                slot_start=m.slot_start,
+                slot_end=m.slot_end,
+                fallback_variant_key=m.fallback_variant_key,
+            )
+            for m in payload.members
+        ]
+    )
+    db.commit()
+    db.refresh(namespace)
+    return namespace
+
+
+def replace_namespace(
+    db: Session, namespace_key: str, payload: NamespaceUpsertRequest
+) -> MutexNamespace:
+    """整体覆盖命名空间描述与全部成员（PUT 全量替换语义）。
+
+    不存在抛 NamespaceNotFound；成员引用 / 兜底变体非法抛 ValueError（422）；
+    成员被其他命名空间占用抛 NamespaceMemberConflict（409）。删除成员
+    本身允许（解除互斥关系是命名空间更新的正常操作，不受 409 保护——
+    409 保护的是直接删除成员开关或移除其兜底变体）。
+    """
+    namespace = get_namespace(db, namespace_key)
+    if namespace is None:
+        raise NamespaceNotFound(namespace_key)
+    _validate_namespace_members(db, payload, replace_namespace_key=namespace_key)
+    namespace.description = payload.description
+    # 单事务内先删旧成员再写新成员；唯一约束冲突（其他命名空间并发占用）
+    # 由 IntegrityError 兜底为 409。
+    db.execute(
+        delete(MutexNamespaceMember).where(
+            MutexNamespaceMember.namespace_key == namespace_key
+        )
+    )
+    db.add_all(
+        [
+            MutexNamespaceMember(
+                namespace_key=namespace_key,
+                flag_key=m.flag_key,
+                slot_start=m.slot_start,
+                slot_end=m.slot_end,
+                fallback_variant_key=m.fallback_variant_key,
+            )
+            for m in payload.members
+        ]
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise NamespaceMemberConflict(
+            "成员开关已被其他命名空间占用（一个开关只能属于一个命名空间）"
+        ) from exc
+    db.refresh(namespace)
+    return namespace
+
+
+def ensure_membership_fallback_variant(
+    db: Session, flag_key: str, variant_keys: set[str]
+) -> None:
+    """配置改写前保护：成员开关的兜底变体必须仍存在于新变体集合中。
+
+    创建 / 更新开关、回滚、发布批次候选（创建时预检 + 提交时事务内再核对）
+    在写入新变体前调用；缺失时抛 FlagInNamespace（-> 409），保证命名空间
+    闸门的未入组兜底永远可解析。先在命名空间整体更新中把兜底改到仍保留
+    的变体，再发布移除变体的配置。
+    """
+    membership = get_namespace_membership(db, flag_key)
+    if membership is None:
+        return
+    if membership.fallback_variant_key not in variant_keys:
+        raise FlagInNamespace(
+            f"开关 {flag_key!r} 是互斥命名空间 {membership.namespace_key!r} 的成员，"
+            f"其未入组兜底变体 {membership.fallback_variant_key!r} 必须保留在当前配置中；"
+            "请先更新该命名空间改用其他兜底变体，再发布移除该变体的配置"
+        )
+
+
+def namespace_to_response(
+    namespace: MutexNamespace, *, members: Sequence[MutexNamespaceMember]
+) -> dict:
+    return {
+        "namespace_key": namespace.namespace_key,
+        "description": namespace.description,
+        "members": [
+            {
+                "flag_key": m.flag_key,
+                "slot_start": m.slot_start,
+                "slot_end": m.slot_end,
+                "fallback_variant_key": m.fallback_variant_key,
+            }
+            for m in members
+        ],
+        "created_at": namespace.created_at,
+        "updated_at": namespace.updated_at,
+    }
+
+
+def ensure_mutex_namespace_tables(db: Session) -> None:
+    """老库幂等补齐互斥命名空间两张表。
+
+    全新库由 ``Base.metadata.create_all`` 直接建表；老库用
+    CREATE TABLE IF NOT EXISTS 兜底，重复执行为空操作。
+    """
+    db.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS mutex_namespaces ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "namespace_key VARCHAR(128) NOT NULL UNIQUE, "
+            "description VARCHAR(512) DEFAULT '', "
+            "created_at DATETIME, "
+            "updated_at DATETIME)"
+        )
+    )
+    db.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS mutex_namespace_members ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "namespace_key VARCHAR(128) NOT NULL, "
+            "flag_key VARCHAR(128) NOT NULL, "
+            "slot_start INTEGER NOT NULL, "
+            "slot_end INTEGER NOT NULL, "
+            "fallback_variant_key VARCHAR(128) NOT NULL, "
+            "created_at DATETIME, "
+            "updated_at DATETIME, "
+            "CONSTRAINT uq_mutex_member_namespace_flag UNIQUE (namespace_key, flag_key), "
+            "CONSTRAINT uq_mutex_member_flag UNIQUE (flag_key))"
+        )
+    )
+    db.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_mutex_namespaces_namespace_key "
+            "ON mutex_namespaces (namespace_key)"
+        )
+    )
+    db.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_mutex_namespace_members_namespace_key "
+            "ON mutex_namespace_members (namespace_key)"
+        )
+    )
+    db.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_mutex_namespace_members_flag_key "
+            "ON mutex_namespace_members (flag_key)"
         )
     )
     db.commit()
