@@ -172,6 +172,40 @@ class Exposure(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ExperimentNamespace(Base):
+    """互斥实验命名空间：把一组开关划分到互不重叠的万分槽位区间。
+
+    members_json 存成员列表（整体更新语义，PUT 全量替换）：
+    [{"flag_key": "exp_a", "slot_start": 0, "slot_end": 2500,
+      "fallback_variant_key": "off"}, ...]
+
+    约束（写入侧校验，见 app.crud）：
+    - 同一命名空间内 [slot_start, slot_end) 区间不得重叠（相邻允许）；
+    - 成员开关必须存在，fallback_variant_key 必须在开关当前配置的变体中；
+    - 一个开关至多属于一个命名空间；
+    - 成员开关被删除、或其兜底变体被配置更新 / 回滚 / 发布批次移除时
+      返回 409，保证“兜底变体一定存在于开关当前配置”这一不变量。
+
+    判定语义：仅判定当前版本（未钉住 config_version）时参与——以
+    namespace_key:user_id 稳定哈希到 0~9999 槽位，命中成员区间才继续
+    原有的窗口 / override / 规则 / 分桶判定，否则直接返回兜底变体
+    （decision_path="excluded"）。
+    """
+
+    __tablename__ = "experiment_namespaces"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    namespace_key: Mapped[str] = mapped_column(
+        String(128), unique=True, nullable=False, index=True
+    )
+    description: Mapped[str] = mapped_column(String(512), default="")
+    members_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class DecisionSnapshot(Base):
     """一次判定请求的完整快照，可按 request_id 回查。"""
 
@@ -201,8 +235,8 @@ class DecisionSnapshot(Base):
     bucket_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
     matched_rule_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     variant_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    # 判定路径：rule / bucket / override。老数据由 ensure_snapshot_decision_path
-    # 按 matched_rule_index 是否为空回填。
+    # 判定路径：rule / bucket / override / inactive / excluded。老数据由
+    # ensure_snapshot_decision_path 按 matched_rule_index 是否为空回填。
     decision_path: Mapped[str | None] = mapped_column(String(16), nullable=True)
     explanation_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

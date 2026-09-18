@@ -1,18 +1,23 @@
 """功能开关判定引擎。
 
 判定顺序：
-0. 配置带生效窗口（activation_window）且当前时刻落在窗口
+0. 开关属于某个互斥实验命名空间且判定未钉住 config_version 时，先以
+   ``namespace_key:user_id`` 稳定哈希到 0~9999 的槽位：槽位未命中该开关的
+   成员区间 ``[slot_start, slot_end)`` 时，跳过窗口、override、规则与分桶，
+   直接返回成员的兜底变体，decision_path="excluded"（未入组）。
+1. 配置带生效窗口（activation_window）且当前时刻落在窗口
    ``[active_from, active_until)`` 之外时，跳过 override、规则与分桶，
    直接返回兜底变体 inactive_variant_key，decision_path="inactive"。
-1. 未指定 config_version 时，先查该 flag+user 是否存在“未过期且变体仍存在于
+2. 未指定 config_version 时，先查该 flag+user 是否存在“未过期且变体仍存在于
    当前配置”的临时强制变体（override）：命中则跳过规则与分桶，直接返回该变体，
    decision_path="override"。到期或变体已移除的记录不生效，继续正常判定。
-2. 按 priority 升序逐条评估规则，返回首个命中规则的 variant_key；
+3. 按 priority 升序逐条评估规则，返回首个命中规则的 variant_key；
    规则所需属性缺失（或类型不兼容）一律视为“未命中”并继续下一条。
-3. 没有规则命中时，对 ``flag_key + ":" + user_id`` 做 SHA-256 稳定哈希，
+4. 没有规则命中时，对 ``flag_key + ":" + user_id`` 做 SHA-256 稳定哈希，
    映射到 0-99 的桶，再按变体权重顺序切桶选变体。
 
-同一用户在配置不变时结果稳定：哈希输入只含 flag_key 与 user_id。
+同一用户在配置不变时结果稳定：分桶哈希输入只含 flag_key 与 user_id，
+命名空间槽位哈希输入只含 namespace_key 与 user_id。
 """
 
 import hashlib
@@ -25,6 +30,10 @@ from app import segments as seg
 
 # 桶空间固定为 100，与“权重总和必须为 100”对应
 BUCKET_SPACE = 100
+
+# 互斥实验命名空间的槽位空间固定为 10000（万分槽位），
+# 成员区间 [slot_start, slot_end) 在其上切分
+NAMESPACE_SLOT_SPACE = 10000
 
 
 @dataclass(frozen=True)
@@ -67,6 +76,21 @@ class ActivationWindow:
     active_until: datetime | None = None
 
 
+@dataclass(frozen=True)
+class NamespaceMember:
+    """互斥实验命名空间的成员：开关占用的槽位区间与未入组兜底变体。
+
+    槽位区间为 ``[slot_start, slot_end)``（起点含、终点不含），取值落在
+    0~10000 的万分槽位空间内；用户槽位未命中区间时返回
+    ``fallback_variant_key``（判定路径 "excluded"）。
+    """
+
+    flag_key: str
+    slot_start: int
+    slot_end: int
+    fallback_variant_key: str
+
+
 class RuleEvaluationError(ValueError):
     """配置本身非法（如规则指向不存在的变体）。"""
 
@@ -80,6 +104,19 @@ def stable_bucket(flag_key: str, user_id: str) -> int:
     raw = f"{flag_key}:{user_id}".encode("utf-8")
     digest = hashlib.sha256(raw).digest()
     return int.from_bytes(digest[:8], "big") % BUCKET_SPACE
+
+
+def namespace_slot(namespace_key: str, user_id: str) -> int:
+    """返回 0..9999 的稳定槽位值（互斥实验命名空间入组判定用）。
+
+    SHA-256("namespace_key:user_id") 大端取前 8 字节对 10000 取模；
+    仅依赖 namespace_key 与 user_id，命名空间不变则同一用户槽位不变。
+    与开关分桶（flag_key 命名）相互独立：同一用户在不同命名空间、
+    以及命名空间槽位与开关分桶之间互不影响。
+    """
+    raw = f"{namespace_key}:{user_id}".encode("utf-8")
+    digest = hashlib.sha256(raw).digest()
+    return int.from_bytes(digest[:8], "big") % NAMESPACE_SLOT_SPACE
 
 
 def _compare(actual: Any, operator: str, expected: list[Any]) -> tuple[bool, str]:
@@ -147,7 +184,7 @@ def pick_variant_by_weight(variants: list[Variant], bucket: int) -> tuple[str, t
 @dataclass
 class Decision:
     variant_key: str
-    decision_path: str  # "rule" | "bucket" | "override" | "inactive"
+    decision_path: str  # "rule" | "bucket" | "override" | "inactive" | "excluded"
     bucket_value: int | None
     matched_rule: Rule | None
     matched_rule_index: int | None  # 排序后从 0 开始
@@ -246,6 +283,51 @@ def inactive_decision(window: ActivationWindow, now: datetime) -> Decision:
     return Decision(
         variant_key=window.inactive_variant_key,
         decision_path="inactive",
+        bucket_value=None,
+        matched_rule=None,
+        matched_rule_index=None,
+        explanation=explanation,
+    )
+
+
+def excluded_decision(
+    namespace_key: str, member: NamespaceMember, user_id: str, slot: int
+) -> Decision:
+    """命名空间未入组判定：跳过窗口、override、规则与分桶，返回兜底变体。
+
+    进入本函数时用户槽位一定落在成员区间之外（由调用方用
+    :func:`namespace_slot` 判定）；解释链记录槽位计算与未命中的区间，
+    语义与 :func:`inactive_decision` 对生效窗口的处理一致。
+    """
+    namespace_detail = {
+        "namespace_key": namespace_key,
+        "flag_key": member.flag_key,
+        "slot_range": [member.slot_start, member.slot_end],
+        "fallback_variant_key": member.fallback_variant_key,
+    }
+    explanation = [
+        {
+            "step": "namespace_loaded",
+            "detail": namespace_detail,
+        },
+        {
+            "step": "namespace_excluded",
+            "detail": {
+                **namespace_detail,
+                "hash_input": f"{namespace_key}:{user_id}",
+                "algorithm": "sha256[:8] % 10000",
+                "slot_value": slot,
+                "selection_reason": (
+                    f"用户槽位 {slot} 未命中成员区间 "
+                    f"[{member.slot_start}, {member.slot_end})，"
+                    "跳过生效窗口、override、规则判定与哈希分桶，返回兜底变体"
+                ),
+            },
+        },
+    ]
+    return Decision(
+        variant_key=member.fallback_variant_key,
+        decision_path="excluded",
         bucket_value=None,
         matched_rule=None,
         matched_rule_index=None,

@@ -13,7 +13,14 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.database import Base, engine, SessionLocal  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Exposure, FlagConfig, FlagConfigVersion, FlagOverride, Segment  # noqa: E402
+from app.models import (  # noqa: E402
+    ExperimentNamespace,
+    Exposure,
+    FlagConfig,
+    FlagConfigVersion,
+    FlagOverride,
+    Segment,
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -33,14 +40,16 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _clean_flags():
-    """每个用例后清空分群、开关、版本历史、强制变体与曝光，保证 key 可重复使用（快照保留）。
+    """每个用例后清空分群、开关、版本历史、强制变体、命名空间与曝光，保证 key 可重复使用（快照保留）。
 
-    分群先于开关规则删除顺序无依赖（分群引用约束为应用层校验，非外键）。
+    分群先于开关规则删除顺序无依赖（分群引用约束为应用层校验，非外键）；
+    命名空间先于开关删除（成员保护为应用层校验，非外键）。
     """
     yield
     db = SessionLocal()
     try:
         db.query(Exposure).delete()
+        db.query(ExperimentNamespace).delete()
         db.query(FlagOverride).delete()
         db.query(FlagConfigVersion).delete()
         db.query(FlagConfig).delete()

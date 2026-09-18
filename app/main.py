@@ -10,6 +10,11 @@
 - GET    /api/v1/segments/{segment_key}  查看单个分群
 - PUT    /api/v1/segments/{segment_key}  更新分群（被引用时返回 409）
 - DELETE /api/v1/segments/{segment_key}  删除分群（被引用时返回 409）
+- POST   /api/v1/namespaces                创建互斥实验命名空间（成员槽位区间 + 兜底变体）
+- GET    /api/v1/namespaces                列出全部命名空间
+- GET    /api/v1/namespaces/{namespace_key}  查看单个命名空间
+- PUT    /api/v1/namespaces/{namespace_key}  整体更新命名空间（全量替换成员列表）
+- DELETE /api/v1/namespaces/{namespace_key}  删除命名空间（解除成员互斥门）
 - PUT    /api/v1/flags/{flag_key}/overrides/{user_id}  写入按用户临时强制变体
 - DELETE /api/v1/flags/{flag_key}/overrides/{user_id}  撤销按用户临时强制变体
 - GET  /api/v1/flags/{flag_key}/versions            列出版本历史
@@ -54,6 +59,9 @@ from app.schemas import (
     FlagResponse,
     FlagUpsertRequest,
     FlagVersionResponse,
+    NamespaceCreateRequest,
+    NamespaceResponse,
+    NamespaceUpsertRequest,
     OverrideResponse,
     OverrideUpsertRequest,
     PreviewChange,
@@ -82,6 +90,7 @@ async def lifespan(app: FastAPI):
         crud.ensure_activation_window_columns(db)
         crud.ensure_snapshot_decision_path(db)
         crud.ensure_decision_audit_indexes(db)
+        crud.ensure_namespaces_table(db)
         crud.backfill_missing_versions(db)
     finally:
         db.close()
@@ -239,6 +248,13 @@ def create_or_update_flag(payload: FlagUpsertRequest, db: Session = Depends(get_
         crud.validate_flag_rule_segments(db, payload.rules)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    # 开关为命名空间成员时，新配置必须保留其兜底变体，否则 409
+    try:
+        crud.validate_flag_keeps_namespace_fallback(
+            db, payload.flag_key, {v.key for v in payload.variants}
+        )
+    except crud.FlagInNamespace as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     try:
         flag = crud.upsert_flag(db, payload)
     except ValueError as exc:
@@ -261,8 +277,12 @@ def get_flag(flag_key: str, db: Session = Depends(get_db)):
 
 @app.delete("/api/v1/flags/{flag_key}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_flag(flag_key: str, db: Session = Depends(get_db)) -> None:
-    if not crud.delete_flag(db, flag_key):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在")
+    """删除开关；仍是命名空间成员时返回 ``409``（需先移出命名空间）。"""
+    try:
+        if not crud.delete_flag(db, flag_key):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在")
+    except crud.FlagInNamespace as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +362,87 @@ def delete_segment(segment_key: str, db: Session = Depends(get_db)) -> None:
             )
     except crud.SegmentInUse as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 互斥实验命名空间
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/v1/namespaces",
+    response_model=NamespaceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_namespace(payload: NamespaceCreateRequest, db: Session = Depends(get_db)):
+    """创建互斥实验命名空间。
+
+    - 每个成员声明 ``[slot_start, slot_end)`` 万分槽位区间（0~9999）与
+      未入组时返回的兜底变体；同一命名空间内区间不得重叠、flag_key 不可
+      重复、成员列表至少 1 个（结构类约束由 Pydantic 返回 ``422``）；
+    - 成员开关必须已存在、兜底变体必须在开关当前配置的变体中、且开关
+      未加入其他命名空间，违反返回 ``422``；
+    - namespace_key 已存在返回 ``409``。
+    """
+    try:
+        namespace = crud.create_namespace(db, payload)
+    except crud.NamespaceKeyConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        )
+    return crud.namespace_to_response(namespace)
+
+
+@app.get("/api/v1/namespaces", response_model=list[NamespaceResponse])
+def list_namespaces(db: Session = Depends(get_db)):
+    return [crud.namespace_to_response(ns) for ns in crud.list_namespaces(db)]
+
+
+@app.get("/api/v1/namespaces/{namespace_key}", response_model=NamespaceResponse)
+def get_namespace(namespace_key: str, db: Session = Depends(get_db)):
+    namespace = crud.get_namespace(db, namespace_key)
+    if namespace is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"命名空间 {namespace_key!r} 不存在",
+        )
+    return crud.namespace_to_response(namespace)
+
+
+@app.put("/api/v1/namespaces/{namespace_key}", response_model=NamespaceResponse)
+def update_namespace(
+    namespace_key: str, payload: NamespaceUpsertRequest, db: Session = Depends(get_db)
+):
+    """整体覆盖命名空间的描述与成员列表（PUT 语义）。
+
+    - 命名空间不存在返回 ``404``；成员校验同创建（``422``）；
+    - 更新只影响之后的判定：既有判定快照不回改，同一 ``request_id``
+      仍重放首次结果。
+    """
+    try:
+        namespace = crud.update_namespace(db, namespace_key, payload)
+    except crud.NamespaceNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"命名空间 {namespace_key!r} 不存在",
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        )
+    return crud.namespace_to_response(namespace)
+
+
+@app.delete("/api/v1/namespaces/{namespace_key}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_namespace(namespace_key: str, db: Session = Depends(get_db)) -> None:
+    """删除命名空间，解除其中全部成员开关的互斥门；不存在返回 ``404``。"""
+    if not crud.delete_namespace(db, namespace_key):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"命名空间 {namespace_key!r} 不存在",
+        )
 
 
 @app.put(
@@ -436,6 +537,8 @@ def rollback_flag(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except crud.VersionNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except crud.FlagInNamespace as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return crud.flag_to_response(flag)
 
 
@@ -477,14 +580,29 @@ def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateRespo
     rules = crud.parse_rules(rules_json)
     variants = crud.parse_variants(variants_json)
 
+    decision = None
+
+    # 互斥实验命名空间门：仅判定当前版本（未钉住 config_version）时参与。
+    # 以 namespace_key:user_id 稳定哈希到 0~9999 槽位，未命中成员区间直接
+    # 返回兜底变体（decision_path="excluded"），命中才继续原有判定链。
+    if req.config_version is None:
+        membership = crud.get_membership_for_flag(db, flag_key)
+        if membership is not None:
+            namespace, member = membership
+            slot = eng.namespace_slot(namespace.namespace_key, req.user_id)
+            if not member.slot_start <= slot < member.slot_end:
+                decision = eng.excluded_decision(
+                    namespace.namespace_key, member, req.user_id, slot
+                )
+
     # 生效窗口按所选配置版本的 [active_from, active_until) 判定：
     # 窗口外跳过 override、规则与分桶，直接返回兜底变体（decision_path="inactive"）。
-    decision = None
-    window = crud.parse_activation_window(window_json)
-    if window is not None:
-        now = datetime.now(timezone.utc)
-        if not eng.window_is_active(window, now):
-            decision = eng.inactive_decision(window, now)
+    if decision is None:
+        window = crud.parse_activation_window(window_json)
+        if window is not None:
+            now = datetime.now(timezone.utc)
+            if not eng.window_is_active(window, now):
+                decision = eng.inactive_decision(window, now)
 
     # 仅在未钉住历史版本时允许临时强制变体：未过期且变体仍存在于当前配置才生效；
     # 到期或变体已移除的记录不参与，继续走规则与分桶。
@@ -799,6 +917,8 @@ def commit_release(release_id: str, db: Session = Depends(get_db)):
     try:
         batch = crud.commit_release(db, batch)
     except crud.VersionConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except crud.FlagInNamespace as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return crud.release_to_response(batch)
 

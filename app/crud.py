@@ -12,6 +12,7 @@ from app import engine as eng
 from app import segments as seg
 from app.models import (
     DecisionSnapshot,
+    ExperimentNamespace,
     Exposure,
     FlagConfig,
     FlagConfigVersion,
@@ -24,6 +25,9 @@ from app.schemas import (
     ActivationWindowIn,
     FlagConfigBody,
     FlagUpsertRequest,
+    NamespaceCreateRequest,
+    NamespaceMemberIn,
+    NamespaceUpsertRequest,
     OverrideUpsertRequest,
     RuleIn,
     SegmentCreateRequest,
@@ -58,6 +62,18 @@ class VersionConflict(Exception):
 
 class ExposureConflict(Exception):
     """exposure_id 已被用于指向另一判定快照（request_id 不一致）。"""
+
+
+class NamespaceKeyConflict(Exception):
+    """创建命名空间时 key 已存在。"""
+
+
+class NamespaceNotFound(Exception):
+    """命名空间不存在。"""
+
+
+class FlagInNamespace(Exception):
+    """开关仍是互斥实验命名空间成员，禁止删除或移除其兜底变体。"""
 
 
 def serialize_config_body(payload: FlagConfigBody) -> tuple[str, str, str | None]:
@@ -191,6 +207,11 @@ def rollback_flag(
             f"开关 {flag_key!r} 没有版本 {target_version}"
         )
 
+    # 命名空间成员的兜底变体必须保留在回滚后的当前配置中
+    validate_flag_keeps_namespace_fallback(
+        db, flag_key, {v["key"] for v in json.loads(target.variants_json)}
+    )
+
     flag.description = target.description
     flag.rules_json = target.rules_json
     flag.variants_json = target.variants_json
@@ -223,6 +244,15 @@ def delete_flag(db: Session, flag_key: str) -> bool:
     flag = get_flag_or_none(db, flag_key)
     if flag is None:
         return False
+    # 命名空间成员开关禁止删除：成员区间与兜底变体依赖该开关存在，
+    # 需要先通过命名空间整体更新把该开关移出成员列表
+    membership = get_membership_for_flag(db, flag_key)
+    if membership is not None:
+        namespace, _member = membership
+        raise FlagInNamespace(
+            f"开关 {flag_key!r} 仍是命名空间 {namespace.namespace_key!r} 的成员，"
+            "禁止删除；请先从命名空间移除该成员"
+        )
     # 版本历史随开关一起删除，避免删除后重建同 key 开关时版本号冲突
     db.execute(delete(FlagConfigVersion).where(FlagConfigVersion.flag_key == flag_key))
     # 按用户强制变体一并删除；重建后的同名开关不带任何 override
@@ -732,6 +762,12 @@ def commit_release(db: Session, batch: ReleaseBatch) -> ReleaseBatch:
                 validate_flag_rule_segments(db, candidate_rules)
             except ValueError as exc:
                 raise VersionConflict(str(exc)) from exc
+            # 命名空间成员的兜底变体同样不可被候选配置移除（整批 409 回滚）
+            validate_flag_keeps_namespace_fallback(
+                db,
+                item["flag_key"],
+                {v["key"] for v in json.loads(item["variants_json"])},
+            )
             new_versions[item["flag_key"]] = expected + 1
 
         # 全部条件更新命中后，在同一事务追加不可变版本（只增不改）
@@ -958,6 +994,206 @@ def ensure_segments_table(db: Session) -> None:
         text(
             "CREATE INDEX IF NOT EXISTS ix_segments_segment_key "
             "ON segments (segment_key)"
+        )
+    )
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# 互斥实验命名空间
+# ---------------------------------------------------------------------------
+
+
+def serialize_members(members: Sequence[NamespaceMemberIn]) -> str:
+    """把成员列表序列化为存储 JSON（保持请求顺序，与 variants 存储风格一致）。"""
+    return json.dumps([m.model_dump() for m in members], ensure_ascii=False)
+
+
+def parse_members(raw: str) -> list[eng.NamespaceMember]:
+    return [eng.NamespaceMember(**item) for item in json.loads(raw or "[]")]
+
+
+def get_namespace(db: Session, namespace_key: str) -> ExperimentNamespace | None:
+    return db.scalar(
+        select(ExperimentNamespace).where(
+            ExperimentNamespace.namespace_key == namespace_key
+        )
+    )
+
+
+def list_namespaces(db: Session) -> Sequence[ExperimentNamespace]:
+    return db.scalars(
+        select(ExperimentNamespace).order_by(ExperimentNamespace.namespace_key)
+    ).all()
+
+
+def get_membership_for_flag(
+    db: Session, flag_key: str
+) -> tuple[ExperimentNamespace, eng.NamespaceMember] | None:
+    """返回开关所属的 (命名空间, 成员配置)；不属于任何命名空间返回 None。
+
+    写入侧保证一个开关至多是一个命名空间的成员，因此首个命中即唯一。
+    """
+    for namespace in list_namespaces(db):
+        for member in parse_members(namespace.members_json):
+            if member.flag_key == flag_key:
+                return namespace, member
+    return None
+
+
+def validate_namespace_members(
+    db: Session,
+    members: Sequence[NamespaceMemberIn],
+    *,
+    exclude_namespace_key: str | None = None,
+) -> None:
+    """校验成员引用的开关与兜底变体存在、且开关未加入其他命名空间。
+
+    违反任一条抛 ValueError（路由层映射为 422）：
+    - 成员开关必须已存在；
+    - fallback_variant_key 必须在该开关**当前配置**的变体中；
+    - 一个开关至多属于一个命名空间（更新时自身除外）。
+    结构类约束（区间形态、重叠、flag_key 重复）由 Pydantic 层先行拦截。
+    """
+    flag_keys = [m.flag_key for m in members]
+    flags = {
+        f.flag_key: f
+        for f in db.scalars(
+            select(FlagConfig).where(FlagConfig.flag_key.in_(flag_keys))
+        ).all()
+    }
+    missing = sorted(set(flag_keys) - set(flags))
+    if missing:
+        raise ValueError(f"成员开关不存在：{', '.join(missing)}")
+    for m in members:
+        variant_keys = {v.key for v in parse_variants(flags[m.flag_key].variants_json)}
+        if m.fallback_variant_key not in variant_keys:
+            raise ValueError(
+                f"成员 {m.flag_key!r} 的兜底变体 {m.fallback_variant_key!r} "
+                "不存在于该开关当前配置的变体中"
+            )
+    # 跨命名空间唯一性：同一开关不能同时是两个命名空间的成员，
+    # 否则判定时无法确定应用哪个命名空间的区间
+    claimed = set(flag_keys)
+    for namespace in list_namespaces(db):
+        if namespace.namespace_key == exclude_namespace_key:
+            continue
+        for member in parse_members(namespace.members_json):
+            if member.flag_key in claimed:
+                raise ValueError(
+                    f"开关 {member.flag_key!r} 已是命名空间 "
+                    f"{namespace.namespace_key!r} 的成员，一个开关至多加入一个命名空间"
+                )
+
+
+def create_namespace(
+    db: Session, payload: NamespaceCreateRequest
+) -> ExperimentNamespace:
+    """创建命名空间；key 已存在抛 NamespaceKeyConflict（-> 409）。
+
+    成员引用校验（开关存在、兜底变体存在、跨命名空间唯一）不满足抛
+    ValueError（-> 422）。
+    """
+    if get_namespace(db, payload.namespace_key) is not None:
+        raise NamespaceKeyConflict(f"命名空间 {payload.namespace_key!r} 已存在")
+    validate_namespace_members(db, payload.members)
+    namespace = ExperimentNamespace(
+        namespace_key=payload.namespace_key,
+        description=payload.description,
+        members_json=serialize_members(payload.members),
+    )
+    db.add(namespace)
+    db.commit()
+    db.refresh(namespace)
+    return namespace
+
+
+def update_namespace(
+    db: Session, namespace_key: str, payload: NamespaceUpsertRequest
+) -> ExperimentNamespace:
+    """整体覆盖命名空间的描述与成员列表；不存在抛 NamespaceNotFound（-> 404）。
+
+    成员校验同创建（跨命名空间唯一性检查排除自身）。更新只影响之后的
+    判定：既有判定快照不回改，同一 request_id 仍重放首次结果。
+    """
+    namespace = get_namespace(db, namespace_key)
+    if namespace is None:
+        raise NamespaceNotFound(namespace_key)
+    validate_namespace_members(
+        db, payload.members, exclude_namespace_key=namespace_key
+    )
+    namespace.description = payload.description
+    namespace.members_json = serialize_members(payload.members)
+    db.commit()
+    db.refresh(namespace)
+    return namespace
+
+
+def delete_namespace(db: Session, namespace_key: str) -> bool:
+    """删除命名空间（解除其中全部成员的互斥门）；不存在返回 False。"""
+    namespace = get_namespace(db, namespace_key)
+    if namespace is None:
+        return False
+    db.delete(namespace)
+    db.commit()
+    return True
+
+
+def validate_flag_keeps_namespace_fallback(
+    db: Session, flag_key: str, variant_keys: set[str]
+) -> None:
+    """开关为命名空间成员时，新当前配置的变体必须仍包含其兜底变体。
+
+    创建 / 更新开关、回滚、发布批次提交共用本校验，违反抛
+    FlagInNamespace（-> 409），保证“成员兜底变体一定存在于开关当前
+    配置”这一不变量；需要先通过命名空间整体更新移除该成员或改选
+    其他兜底变体。
+    """
+    membership = get_membership_for_flag(db, flag_key)
+    if membership is None:
+        return
+    namespace, member = membership
+    if member.fallback_variant_key not in variant_keys:
+        raise FlagInNamespace(
+            f"开关 {flag_key!r} 是命名空间 {namespace.namespace_key!r} 的成员："
+            f"新配置必须保留兜底变体 {member.fallback_variant_key!r}"
+            "（或先整体更新命名空间移除该成员 / 改选兜底变体）"
+        )
+
+
+def namespace_to_response(namespace: ExperimentNamespace) -> dict:
+    return {
+        "namespace_key": namespace.namespace_key,
+        "description": namespace.description,
+        "members": [
+            NamespaceMemberIn(**item) for item in json.loads(namespace.members_json)
+        ],
+        "created_at": namespace.created_at,
+        "updated_at": namespace.updated_at,
+    }
+
+
+def ensure_namespaces_table(db: Session) -> None:
+    """老库幂等补齐 experiment_namespaces 表。
+
+    全新库由 ``Base.metadata.create_all`` 直接建表；老库用
+    CREATE TABLE IF NOT EXISTS 兜底，重复执行为空操作。
+    """
+    db.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS experiment_namespaces ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "namespace_key VARCHAR(128) NOT NULL UNIQUE, "
+            "description VARCHAR(512) DEFAULT '', "
+            "members_json TEXT NOT NULL DEFAULT '[]', "
+            "created_at DATETIME, "
+            "updated_at DATETIME)"
+        )
+    )
+    db.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_experiment_namespaces_namespace_key "
+            "ON experiment_namespaces (namespace_key)"
         )
     )
     db.commit()
